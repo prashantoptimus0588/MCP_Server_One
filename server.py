@@ -10,7 +10,7 @@ import yfinance as yf
 from mcp.server.fastmcp import FastMCP
 
 # Import Pydantic models
-from models import (
+from models.models import (
     DailyBar,
     PriceData,
     FundamentalsData,
