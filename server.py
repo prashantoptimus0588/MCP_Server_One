@@ -1,6 +1,9 @@
 import os
 from mcp.server.fastmcp import FastMCP
 import yfinance as yf
+import feedparser
+from urllib.parse import quote
+from datetime import datetime, timezone
 
 mcp = FastMCP(
     "news_server",
@@ -11,14 +14,52 @@ mcp = FastMCP(
 #############  News and Weather Tools ##############
 
 @mcp.tool()
-def get_news(location:str)->str:
-    """Get the current news for a given location."""
-    
-    if "delhi" in location.lower():
-        return "Massive Protest regarding vote chori are going on"
-    
-    return "Stock market of India is falling very bad"
+def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
+    """
+    Fetch recent news headlines about a company or stock, newest first, each with its date and source.
+    Pass the COMPANY NAME plus the word 'stock' (e.g. 'State Bank of India stock'),
+    not the ticker symbol, because news search works better with names.
+    'days' = how far back to look (1-30). 'max_items' = how many headlines to return (1-10).
+    """
+    try:
+        days = max(1, min(days, 30))
+        max_items = max(1, min(max_items, 10))
 
+        search = quote(f"{query} when:{days}d")
+        url = f"https://news.google.com/rss/search?q={search}&hl=en-IN&gl=IN&ceid=IN:en"
+        feed = feedparser.parse(url)
+
+        if getattr(feed, "bozo", 0) and not feed.entries:
+            return "Error: could not fetch the news feed right now."
+
+        if not feed.entries:
+            return f"No news found for '{query}' in the last {days} days."
+
+        now = datetime.now(timezone.utc)
+        items = []
+        for e in feed.entries:
+            if not getattr(e, "published_parsed", None):
+                continue
+            published = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+            source = e.get("source", {}).get("title", "Unknown source")
+            items.append((published, e.title, source))
+
+        if not items:
+            return f"No dated news found for '{query}' in the last {days} days."
+
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        lines = [f"Latest news for '{query}' (last {days} days, newest first):"]
+        for published, title, source in items[:max_items]:
+            hours = int((now - published).total_seconds() // 3600)
+            age = f"{hours}h ago" if hours < 48 else f"{hours // 24}d ago"
+            lines.append(f"- [{published:%Y-%m-%d %H:%M} UTC, {age}] {title} ({source})")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error executing news tool: {str(e)}"
+    
 @mcp.tool()
 def get_weather(location: str) -> str:
     """Get the current weather for a given location."""
@@ -140,6 +181,8 @@ def getStock_fundamentals(stock: str) -> str:
 
     except Exception as e:
         return f"Error executing fundamental tool: {str(e)}"
+
+
 
 
 if __name__ == "__main__":
