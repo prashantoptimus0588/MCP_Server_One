@@ -1,89 +1,84 @@
 import os
-import math
-import json
+import urllib.error
 import urllib.request
-from urllib.parse import quote
 from datetime import datetime, timezone
+from urllib.parse import quote
+
 import feedparser
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
-from models.models import PriceData, DailyBar, FundamentalsData, NewsData, NewsItem
 
-# Initialize the FastMCP Server
 mcp = FastMCP(
     "news_server",
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8000)),
 )
 
-def _clean(x, digits=2):
-    """Round a number, or return None if it is missing or NaN."""
-    try:
-        x = float(x)
-    except (TypeError, ValueError):
-        return None
-    return None if math.isnan(x) or math.isinf(x) else round(x, digits)
+# Below this average daily volume a listing is treated as illiquid / possibly the wrong symbol
+LOW_VOLUME_THRESHOLD = 50_000
+# If the newest bar is older than this many days, the data is considered stale
+STALE_DAYS = 7
+# Google News tends to reject the default feedparser/urllib agent from cloud hosts
+NEWS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-def _pct(x):
-    """Turn a fraction (0.15) into a percent number (15.0), or None if missing."""
-    try:
-        return _clean(float(x) * 100)
-    except (TypeError, ValueError):
-        return None
 
-#############  News and Weather Tools ##############
+############# Helpers ##############
 
-@mcp.tool()
-def get_general_news(query: str, days: int = 7, max_items: int = 6) -> str:
-    """
-    Fetch recent general news headlines about any topic or event, newest first, each with its date and source.
-    
-    :param query: The search term, topic, or event name (e.g., 'artificial intelligence', 'global warming').
-    :param days: How far back to look in days (1-30). Defaults to 7.
-    :param max_items: Max number of headlines to return (1-10). Defaults to 6.
-    """
+def _fetch_news(query: str, days: int, max_items: int, label: str) -> str:
+    """Shared Google News RSS fetcher used by both news tools."""
     try:
         days = max(1, min(days, 30))
         max_items = max(1, min(max_items, 10))
 
-        encoded_query = quote(f"{query} when:{days}d")
-        url = f"https://google.com{encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
-        feed = feedparser.parse(url)
+        search = quote(f"{query} when:{days}d")
+        url = f"https://news.google.com/rss/search?q={search}&hl=en-IN&gl=IN&ceid=IN:en"
+        # Fetch ourselves (User-Agent + timeout) instead of feedparser's default fetcher,
+        # which Google often blocks, and so we can report the real failure reason.
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": NEWS_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            return f"Error: news feed request failed with HTTP {e.code} ({e.reason})."
+        except Exception as e:
+            return f"Error: could not reach the news feed ({type(e).__name__}: {e})."
 
-        news_data = NewsData(query=query, items=[])
+        feed = feedparser.parse(raw)
 
         if getattr(feed, "bozo", 0) and not feed.entries:
-            return f'{{"error": "Could not fetch the news feed right now."}}'
+            reason = getattr(feed, "bozo_exception", "unknown parse error")
+            return f"Error: could not parse the news feed ({reason})."
 
         if not feed.entries:
-            return news_data.model_dump_json()
+            return f"No news found for '{query}' in the last {days} days."
 
-        raw_items = []
+        now = datetime.now(timezone.utc)
+        items = []
         for e in feed.entries:
             if not getattr(e, "published_parsed", None):
                 continue
             published = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
             source = e.get("source", {}).get("title", "Unknown source")
-            raw_items.append((published, e.title, source))
+            items.append((published, e.title, source))
 
-        if not raw_items:
-            return news_data.model_dump_json()
+        if not items:
+            return f"No dated news found for '{query}' in the last {days} days."
 
-        raw_items.sort(key=lambda x: x[0], reverse=True)
+        items.sort(key=lambda x: x[0], reverse=True)
 
-        for published, title, source in raw_items[:max_items]:
-            news_data.items.append(
-                NewsItem(
-                    published=published.strftime("%Y-%m-%d %H:%M UTC"),
-                    title=title,
-                    source=source
-                )
-            )
+        lines = [f"Latest {label} for '{query}' (last {days} days, newest first):"]
+        for published, title, source in items[:max_items]:
+            hours = int((now - published).total_seconds() // 3600)
+            age = f"{hours}h ago" if hours < 48 else f"{hours // 24}d ago"
+            lines.append(f"- [{published:%Y-%m-%d %H:%M} UTC, {age}] {title} ({source})")
 
-        return news_data.model_dump_json()
+        return "\n".join(lines)
 
     except Exception as e:
-        return f'{{"error": "Error executing general news tool: {str(e)}"}}'
+        return f"Error executing news tool: {str(e)}"
+
+
+############# News and Weather Tools ##############
 
 @mcp.tool()
 def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
@@ -92,176 +87,231 @@ def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
     Pass the COMPANY NAME plus the word 'stock' (e.g. 'State Bank of India stock'),
     not the ticker symbol, because news search works better with names.
     'days' = how far back to look (1-30). 'max_items' = how many headlines to return (1-10).
-    Returns a Pydantic NewsData object serialized to a JSON string.
     """
-    try:
-        days = max(1, min(days, 30))
-        max_items = max(1, min(max_items, 10))
+    return _fetch_news(query, days, max_items, label="news")
 
-        search = quote(f"{query} when:{days}d")
-        url = f"https://google.com{search}&hl=en-IN&gl=IN&ceid=IN:en"
-        feed = feedparser.parse(url)
 
-        news_data = NewsData(query=query, items=[])
+@mcp.tool()
+def get_general_news(topic: str, days: int = 3, max_items: int = 6) -> str:
+    """
+    Fetch recent news headlines on a general, non-company topic (world events, economy,
+    policy, sectors, commodities), newest first, each with its date and source.
+    'days' = how far back to look (1-30). 'max_items' = how many headlines to return (1-10).
+    """
+    return _fetch_news(topic, days, max_items, label="headlines")
 
-        if getattr(feed, "bozo", 0) and not feed.entries:
-            return f'{{"error": "Could not fetch the news feed right now."}}'
 
-        if not feed.entries:
-            return news_data.model_dump_json()
-
-        raw_items = []
-        for e in feed.entries:
-            if not getattr(e, "published_parsed", None):
-                continue
-            published = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-            source = e.get("source", {}).get("title", "Unknown source")
-            raw_items.append((published, e.title, source))
-
-        if not raw_items:
-            return news_data.model_dump_json()
-
-        raw_items.sort(key=lambda x: x[0], reverse=True)
-
-        for published, title, source in raw_items[:max_items]:
-            news_data.items.append(
-                NewsItem(
-                    published=published.strftime("%Y-%m-%d %H:%M UTC"),
-                    title=title,
-                    source=source
-                )
-            )
-
-        return news_data.model_dump_json()
-
-    except Exception as e:
-        return f'{{"error": "Error executing stock news tool: {str(e)}"}}'
- 
 @mcp.tool()
 def get_weather(location: str) -> str:
+    """Get the current weather for a given location. (Demo stub, returns fixed values.)"""
+    if "delhi" in location.lower():
+        return "It's 15°C and rainy."
+    return "It's 22°C and sunny."
+
+
+############# Stock Tools ##############
+
+@mcp.tool()
+def search_ticker(query: str, max_results: int = 5) -> str:
     """
-    Get the live weather summary for a given location using free API-keyless wttr.in.
-    Returns plain text weather status string.
+    Look up the correct ticker symbol for a company name (e.g. 'Suzuki Motor', 'Maruti Suzuki').
+    Returns candidate symbols with company name, exchange and type.
+    Use this BEFORE the price/fundamentals tools whenever you are not 100% sure of the exact
+    symbol, and pick the listing on the primary exchange (NSE for Indian companies).
     """
     try:
-        clean_location = location.strip()
-        if not clean_location:
-            return "Error: Location string cannot be empty."
+        max_results = max(1, min(max_results, 10))
+        quotes = yf.Search(query, max_results=max_results).quotes
 
-        encoded_location = quote(clean_location)
-        url = f"https://wttr.in{encoded_location}?format=j1"
-        
-        req = urllib.request.Request(url, headers={'User-Agent': 'mcp-weather-server/1.0'})
-        
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            current_condition = data['current_condition'][0]
-            temp_c = current_condition['temp_C']
-            weather_desc = current_condition['weatherDesc'][0]['value']
-            humidity = current_condition['humidity']
-            wind_speed = current_condition['windspeedKmph']
-            
-            return (
-                f"It's currently {weather_desc} in {clean_location.title()}. "
-                f"Temperature: {temp_c}°C, Humidity: {humidity}%, Wind Speed: {wind_speed} km/h."
+        if not quotes:
+            return f"No ticker matches found for '{query}'."
+
+        equities = [q for q in quotes if q.get("quoteType") in ("EQUITY", "ETF")]
+        quotes = equities or quotes
+
+        lines = [f"Ticker candidates for '{query}':"]
+        for q in quotes:
+            name = q.get("longname") or q.get("shortname") or "N/A"
+            lines.append(
+                f"- {q.get('symbol', 'N/A')} | {name} | "
+                f"Exchange: {q.get('exchDisp') or q.get('exchange', 'N/A')} | "
+                f"Type: {q.get('quoteType', 'N/A')}"
             )
-    except Exception as e:
-        return f"Error executing weather tool: Could not retrieve live data for '{location}'. ({str(e)})"
+        lines.append("Verify exchange and currency match the company you want before using a symbol.")
+        return "\n".join(lines)
 
-#############  Stock Analytics Tools ##############
+    except Exception as e:
+        return f"Error executing ticker search: {str(e)}"
+
 
 @mcp.tool()
 def getStock_price_info(stock: str, days: int = 5) -> str:
     """
-    Fetch price data for a stock as JSON: recent daily OHLCV bars plus risk metrics
-    (annualized volatility, max drawdown, current drawdown, 52-week range, average volume).
-    'days' = how many recent trading days to include (1-30). Risk metrics always use the last 1 year.
-    Use the exchange suffix for Indian stocks, e.g. SBIN.NS.
+    Fetch recent daily OHLCV rows plus risk metrics (annualized volatility, max drawdown,
+    current drawdown, 52-week range) for technical analysis. Also reports exchange, currency
+    and data-quality warnings (illiquid / stale data).
+    'days' = how many recent trading days to list (1-30). Risk metrics always use the last 1 year.
     """
     try:
+        days = max(1, min(days, 30))
         clean_stock = stock.strip().upper()
-        df = yf.Ticker(clean_stock).history(period="1y")
+        ticker = yf.Ticker(clean_stock)
+        df = ticker.history(period="1y")
 
         if df.empty:
-            return f'{{"error": "No trading data available for ticker \'{clean_stock}\'."}}'
-
-        days = max(1, min(days, 30))
-        bars = [
-            DailyBar(
-                date=d.strftime('%Y-%m-%d'),
-                open=round(r['Open'], 2),
-                high=round(r['High'], 2),
-                low=round(r['Low'], 2),
-                close=round(r['Close'], 2),
-                volume=int(r['Volume']),
+            return (
+                f"Error: No trading data available for ticker '{clean_stock}'. "
+                f"Use search_ticker to find the correct symbol."
             )
-            for d, r in df.tail(days).iterrows()
+
+        meta = getattr(ticker, "history_metadata", None) or {}
+        currency = meta.get("currency", "N/A")
+        exchange = meta.get("fullExchangeName") or meta.get("exchangeName") or "N/A"
+
+        # Recent rows to display
+        recent = df.tail(days)
+        lines = [
+            f"Recent OHLCV for {clean_stock} (Exchange: {exchange}, Currency: {currency}, "
+            f"last {len(recent)} trading days):"
         ]
+        for date, row in recent.iterrows():
+            date_str = date.strftime('%Y-%m-%d')
+            lines.append(
+                f"- Date: {date_str} | Open: {row['Open']:.2f} | High: {row['High']:.2f} | "
+                f"Low: {row['Low']:.2f} | Close: {row['Close']:.2f} | Volume: {int(row['Volume'])}"
+            )
 
+        # Risk metrics over the full 1 year
         returns = df['Close'].pct_change().dropna()
-        volatility = returns.std() * (252 ** 0.5) * 100
-        drawdown = (df['Close'] / df['Close'].cummax() - 1) * 100
+        volatility = returns.std() * (252 ** 0.5) * 100          # annualized, in %
+        running_max = df['Close'].cummax()
+        drawdown = (df['Close'] / running_max - 1) * 100         # % below the peak so far
+        max_drawdown = drawdown.min()
+        current_drawdown = drawdown.iloc[-1]
 
-        data = PriceData(
-            ticker=clean_stock,
-            latest_close=_clean(df['Close'].iloc[-1]),
-            high_52w=_clean(df['High'].max()),
-            low_52w=_clean(df['Low'].min()),
-            volatility_pct=_clean(volatility),
-            max_drawdown_pct=_clean(drawdown.min()),
-            current_drawdown_pct=_clean(drawdown.iloc[-1]),
-            avg_volume=int(df['Volume'].mean()),
-            recent_bars=bars,
-        )
-        return data.model_dump_json()
+        last_close = df['Close'].iloc[-1]
+        high_52 = df['High'].max()
+        low_52 = df['Low'].min()
+        avg_volume = df['Volume'].mean()
+
+        lines.append("\nRisk & Range Metrics (last 1 year):")
+        lines.append(f"- Latest Close: {last_close:.2f} {currency}")
+        lines.append(f"- 52-Week High: {high_52:.2f}")
+        lines.append(f"- 52-Week Low: {low_52:.2f}")
+        lines.append(f"- Annualized Volatility: {volatility:.2f}%")
+        lines.append(f"- Max Drawdown: {max_drawdown:.2f}%")
+        lines.append(f"- Current Drawdown from Peak: {current_drawdown:.2f}%")
+        lines.append(f"- Average Daily Volume: {int(avg_volume)}")
+
+        # Data-quality warnings so the model doesn't present bad data as fact
+        warnings = []
+        if avg_volume < LOW_VOLUME_THRESHOLD:
+            warnings.append(
+                f"Average daily volume is very low ({int(avg_volume)} shares). This looks like an "
+                f"illiquid listing or the wrong symbol; prices and risk metrics may not be meaningful."
+            )
+        last_dt = df.index[-1].to_pydatetime()
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - last_dt).days
+        if age_days > STALE_DAYS:
+            warnings.append(f"Latest data point is {age_days} days old; the stock may be delisted or stale.")
+
+        if warnings:
+            lines.append("\n⚠️ DATA QUALITY WARNING:")
+            lines.extend(f"- {w}" for w in warnings)
+            lines.append("- Verify the symbol with search_ticker and tell the user the data may be unreliable.")
+
+        return "\n".join(lines)
 
     except Exception as e:
-        return f'{{"error": "Error executing price tool: {str(e)}"}}'
-    
+        return f"Error executing price tool: {str(e)}"
+
+
 @mcp.tool()
 def getStock_fundamentals(stock: str) -> str:
     """
-    Fetch fundamental metrics for a stock as JSON: valuation (P/E, P/B), profitability (ROE, margin),
-    growth (revenue, earnings), debt-to-equity, free cash flow, beta, market cap and dividend yield.
-    Missing values are null. Banks usually have no debt-to-equity or free cash flow.
-    Use the exchange suffix for Indian stocks, e.g. SBIN.NS.
+    Fetch core fundamental metrics: valuation (P/E, P/B), profitability (ROE, margin),
+    growth (revenue, earnings), financial health (debt-to-equity, FCF), dividend yield, beta and market cap.
+    Use this when evaluating long-term intrinsic value or financial health.
+    Reports a data-quality warning when most metrics are missing.
     """
     try:
         clean_stock = stock.strip().upper()
-        info = yf.Ticker(clean_stock).info
+        ticker = yf.Ticker(clean_stock)
+        info = ticker.info
 
-        if not info or len(info) <= 5:
-            return f'{{"error": "Could not retrieve fundamental analysis metrics for ticker \'{clean_stock}\'."}}'
+        if not info or len(info) <= 5:  # yfinance returns a tiny fallback dict if invalid
+            return (
+                f"Error: Could not retrieve fundamental analysis metrics for ticker '{clean_stock}'. "
+                f"Use search_ticker to find the correct symbol."
+            )
 
-        de_raw = _clean(info.get('debtToEquity'))
-        debt_to_equity = round(de_raw / 100, 2) if de_raw is not None else None
+        def pct(value):
+            # for fields yfinance gives as a fraction (0.15 -> 15.00%)
+            return f"{value * 100:.2f}%" if isinstance(value, (int, float)) else "N/A"
 
-        data = FundamentalsData(
-            ticker=clean_stock,
-            company_name=info.get('longName'),
-            sector=info.get('sector'),
-            market_cap=_clean(info.get('marketCap'), 0),
-            beta=_clean(info.get('beta')),
-            trailing_pe=_clean(info.get('trailingPE')),
-            forward_pe=_clean(info.get('forwardPE')),
-            price_to_book=_clean(info.get('priceToBook')),
-            roe_pct=_pct(info.get('returnOnEquity')),
-            profit_margin_pct=_pct(info.get('profitMargins')),
-            revenue_growth_pct=_pct(info.get('revenueGrowth')),
-            earnings_growth_pct=_pct(info.get('earningsGrowth')),
-            debt_to_equity=debt_to_equity,
-            free_cash_flow=_clean(info.get('freeCashflow'), 0),
-            dividend_yield_pct=_clean(info.get('dividendYield')),
-        )
-        return data.model_dump_json()
+        def num(value, digits=2):
+            return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "N/A"
+
+        company_name = info.get('longName', clean_stock)
+        sector = info.get('sector', 'N/A')
+        exchange = info.get('fullExchangeName') or info.get('exchange', 'N/A')
+        currency = info.get('currency', 'N/A')
+
+        market_cap = info.get('marketCap')
+        f_mcap = f"{market_cap:,} {currency}" if isinstance(market_cap, (int, float)) else "N/A"
+
+        free_cash_flow = info.get('freeCashflow')
+        f_fcf = f"{free_cash_flow:,} {currency}" if isinstance(free_cash_flow, (int, float)) else "N/A"
+
+        # yfinance reports debtToEquity as a percentage (45 means 0.45)
+        de_raw = info.get('debtToEquity')
+        f_de = f"{de_raw / 100:.2f}" if isinstance(de_raw, (int, float)) else "N/A"
+
+        summary = [
+            f"Fundamental Profile for {company_name} ({clean_stock}):",
+            f"- Exchange: {exchange} | Currency: {currency}",
+            f"- Sector: {sector}",
+            f"- Market Cap: {f_mcap}",
+            f"- Beta (vs market): {num(info.get('beta'))}",
+            "\n[Valuation]",
+            f"  - Trailing P/E: {num(info.get('trailingPE'))}",
+            f"  - Forward P/E: {num(info.get('forwardPE'))}",
+            f"  - Price-to-Book: {num(info.get('priceToBook'))}",
+            "\n[Profitability]",
+            f"  - ROE: {pct(info.get('returnOnEquity'))}",
+            f"  - Net Profit Margin: {pct(info.get('profitMargins'))}",
+            "\n[Growth]",
+            f"  - Revenue Growth: {pct(info.get('revenueGrowth'))}",
+            f"  - Earnings Growth: {pct(info.get('earningsGrowth'))}",
+            "\n[Financial Health]",
+            f"  - Debt-to-Equity (ratio): {f_de}",
+            f"  - Free Cash Flow: {f_fcf}",
+            "\n[Dividend]",
+            f"  - Dividend Yield (raw value as reported by yfinance, units vary by version): "
+            f"{num(info.get('dividendYield'))}",
+        ]
+
+        # Data-quality check: how many core metrics are actually present?
+        core_keys = [
+            'marketCap', 'beta', 'trailingPE', 'forwardPE', 'priceToBook', 'returnOnEquity',
+            'profitMargins', 'revenueGrowth', 'earningsGrowth', 'debtToEquity', 'freeCashflow',
+        ]
+        missing = sum(1 for k in core_keys if not isinstance(info.get(k), (int, float)))
+        if missing >= len(core_keys) // 2:
+            summary.append(
+                f"\n⚠️ DATA QUALITY WARNING: {missing} of {len(core_keys)} core metrics are missing. "
+                f"This is likely an obscure/illiquid listing or the wrong symbol. "
+                f"Verify with search_ticker and tell the user the data is incomplete; do not infer valuation from it."
+            )
+
+        return "\n".join(summary)
 
     except Exception as e:
-        return f'{{"error": "Error executing fundamental tool: {str(e)}"}}'
-
+        return f"Error executing fundamental tool: {str(e)}"
 
 
 if __name__ == "__main__":
-    # Start the server using Stdio transport layer
+    # Start the server using the streamable-http transport
     mcp.run(transport='streamable-http')
-    
-    

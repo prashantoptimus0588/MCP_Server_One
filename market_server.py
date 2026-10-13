@@ -1,123 +1,102 @@
-from mcp.server.fastmcp import FastMCP
+import os
+import math
+import json
+import urllib.request
+from urllib.parse import quote
+from datetime import datetime, timezone
+import feedparser
 import yfinance as yf
+from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("Market_Server")
 
 @mcp.tool()
 def getStock_price_info(stock: str, days: int = 5) -> str:
     """
-    Fetch recent daily OHLCV rows plus risk metrics (annualized volatility, max drawdown,
-    current drawdown, 52-week range) for technical analysis.
-    'days' = how many recent trading days to list. Risk metrics always use the last 1 year.
+    Fetch price data for a stock as JSON: recent daily OHLCV bars plus risk metrics
+    (annualized volatility, max drawdown, current drawdown, 52-week range, average volume).
+    'days' = how many recent trading days to include (1-30). Risk metrics always use the last 1 year.
+    Use the exchange suffix for Indian stocks, e.g. SBIN.NS.
     """
     try:
         clean_stock = stock.strip().upper()
-        ticker = yf.Ticker(clean_stock)
-        df = ticker.history(period="1y")
+        df = yf.Ticker(clean_stock).history(period="1y")
 
         if df.empty:
-            return f"Error: No trading data available for ticker '{clean_stock}'."
+            return f'{{"error": "No trading data available for ticker \'{clean_stock}\'."}}'
 
-        # Recent rows to display
-        recent = df.tail(days)
-        lines = [f"Recent OHLCV for {clean_stock} (last {len(recent)} trading days):"]
-        for date, row in recent.iterrows():
-            date_str = date.strftime('%Y-%m-%d')
-            lines.append(
-                f"- Date: {date_str} | Open: {row['Open']:.2f} | High: {row['High']:.2f} | "
-                f"Low: {row['Low']:.2f} | Close: {row['Close']:.2f} | Volume: {int(row['Volume'])}"
+        days = max(1, min(days, 30))
+        bars = [
+            DailyBar(
+                date=d.strftime('%Y-%m-%d'),
+                open=round(r['Open'], 2),
+                high=round(r['High'], 2),
+                low=round(r['Low'], 2),
+                close=round(r['Close'], 2),
+                volume=int(r['Volume']),
             )
+            for d, r in df.tail(days).iterrows()
+        ]
 
-        # Risk metrics over the full 1 year
         returns = df['Close'].pct_change().dropna()
-        volatility = returns.std() * (252 ** 0.5) * 100          # annualized, in %
-        running_max = df['Close'].cummax()
-        drawdown = (df['Close'] / running_max - 1) * 100         # % below the peak so far
-        max_drawdown = drawdown.min()
-        current_drawdown = drawdown.iloc[-1]
+        volatility = returns.std() * (252 ** 0.5) * 100
+        drawdown = (df['Close'] / df['Close'].cummax() - 1) * 100
 
-        last_close = df['Close'].iloc[-1]
-        high_52 = df['High'].max()
-        low_52 = df['Low'].min()
-        avg_volume = df['Volume'].mean()
-
-        lines.append("\nRisk & Range Metrics (last 1 year):")
-        lines.append(f"- Latest Close: {last_close:.2f}")
-        lines.append(f"- 52-Week High: {high_52:.2f}")
-        lines.append(f"- 52-Week Low: {low_52:.2f}")
-        lines.append(f"- Annualized Volatility: {volatility:.2f}%")
-        lines.append(f"- Max Drawdown: {max_drawdown:.2f}%")
-        lines.append(f"- Current Drawdown from Peak: {current_drawdown:.2f}%")
-        lines.append(f"- Average Daily Volume: {int(avg_volume)}")
-
-        return "\n".join(lines)
+        data = PriceData(
+            ticker=clean_stock,
+            latest_close=_clean(df['Close'].iloc[-1]),
+            high_52w=_clean(df['High'].max()),
+            low_52w=_clean(df['Low'].min()),
+            volatility_pct=_clean(volatility),
+            max_drawdown_pct=_clean(drawdown.min()),
+            current_drawdown_pct=_clean(drawdown.iloc[-1]),
+            avg_volume=int(df['Volume'].mean()),
+            recent_bars=bars,
+        )
+        return data.model_dump_json()
 
     except Exception as e:
-        return f"Error executing price tool: {str(e)}"
-
-
+        return f'{{"error": "Error executing price tool: {str(e)}"}}'
+    
 @mcp.tool()
 def getStock_fundamentals(stock: str) -> str:
     """
-    Fetch core fundamental metrics: valuation (P/E, P/B), profitability (ROE, margin),
-    growth (revenue, earnings), financial health (debt-to-equity, FCF), dividend yield, beta and market cap.
-    Use this when evaluating long-term intrinsic value or financial health.
+    Fetch fundamental metrics for a stock as JSON: valuation (P/E, P/B), profitability (ROE, margin),
+    growth (revenue, earnings), debt-to-equity, free cash flow, beta, market cap and dividend yield.
+    Missing values are null. Banks usually have no debt-to-equity or free cash flow.
+    Use the exchange suffix for Indian stocks, e.g. SBIN.NS.
     """
     try:
         clean_stock = stock.strip().upper()
-        ticker = yf.Ticker(clean_stock)
-        info = ticker.info
+        info = yf.Ticker(clean_stock).info
 
-        if not info or len(info) <= 5:  # yfinance returns a tiny fallback dict if invalid
-            return f"Error: Could not retrieve fundamental analysis metrics for ticker '{clean_stock}'."
+        if not info or len(info) <= 5:
+            return f'{{"error": "Could not retrieve fundamental analysis metrics for ticker \'{clean_stock}\'."}}'
 
-        def pct(value):
-            # for fields yfinance gives as a fraction (0.15 -> 15.00%)
-            return f"{value * 100:.2f}%" if isinstance(value, (int, float)) else "N/A"
+        de_raw = _clean(info.get('debtToEquity'))
+        debt_to_equity = round(de_raw / 100, 2) if de_raw is not None else None
 
-        def num(value, digits=2):
-            return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "N/A"
-
-        company_name = info.get('longName', clean_stock)
-        sector = info.get('sector', 'N/A')
-        currency = info.get('currency', 'INR')
-
-        market_cap = info.get('marketCap')
-        f_mcap = f"{market_cap:,} {currency}" if isinstance(market_cap, (int, float)) else "N/A"
-
-        free_cash_flow = info.get('freeCashflow')
-        f_fcf = f"{free_cash_flow:,} {currency}" if isinstance(free_cash_flow, (int, float)) else "N/A"
-
-        # yfinance reports debtToEquity as a percentage (45 means 0.45)
-        de_raw = info.get('debtToEquity')
-        f_de = f"{de_raw / 100:.2f}" if isinstance(de_raw, (int, float)) else "N/A"
-
-        summary = [
-            f"Fundamental Profile for {company_name} ({clean_stock}):",
-            f"- Sector: {sector}",
-            f"- Market Cap: {f_mcap}",
-            f"- Beta (vs market): {num(info.get('beta'))}",
-            "\n[Valuation]",
-            f"  - Trailing P/E: {num(info.get('trailingPE'))}",
-            f"  - Forward P/E: {num(info.get('forwardPE'))}",
-            f"  - Price-to-Book: {num(info.get('priceToBook'))}",
-            "\n[Profitability]",
-            f"  - ROE: {pct(info.get('returnOnEquity'))}",
-            f"  - Net Profit Margin: {pct(info.get('profitMargins'))}",
-            "\n[Growth]",
-            f"  - Revenue Growth: {pct(info.get('revenueGrowth'))}",
-            f"  - Earnings Growth: {pct(info.get('earningsGrowth'))}",
-            "\n[Financial Health]",
-            f"  - Debt-to-Equity (ratio): {f_de}",
-            f"  - Free Cash Flow: {f_fcf}",
-            "\n[Dividend]",
-            f"  - Dividend Yield (as reported by yfinance): {num(info.get('dividendYield'))}",
-        ]
-
-        return "\n".join(summary)
+        data = FundamentalsData(
+            ticker=clean_stock,
+            company_name=info.get('longName'),
+            sector=info.get('sector'),
+            market_cap=_clean(info.get('marketCap'), 0),
+            beta=_clean(info.get('beta')),
+            trailing_pe=_clean(info.get('trailingPE')),
+            forward_pe=_clean(info.get('forwardPE')),
+            price_to_book=_clean(info.get('priceToBook')),
+            roe_pct=_pct(info.get('returnOnEquity')),
+            profit_margin_pct=_pct(info.get('profitMargins')),
+            revenue_growth_pct=_pct(info.get('revenueGrowth')),
+            earnings_growth_pct=_pct(info.get('earningsGrowth')),
+            debt_to_equity=debt_to_equity,
+            free_cash_flow=_clean(info.get('freeCashflow'), 0),
+            dividend_yield_pct=_clean(info.get('dividendYield')),
+        )
+        return data.model_dump_json()
 
     except Exception as e:
-        return f"Error executing fundamental tool: {str(e)}"
+        return f'{{"error": "Error executing fundamental tool: {str(e)}"}}'
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')
