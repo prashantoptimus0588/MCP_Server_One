@@ -204,6 +204,11 @@ def getStock_fundamentals(stock: str) -> str:
         de_raw = info.get("debtToEquity")
         debt_to_equity = round(float(de_raw) / 100.0, 2) if isinstance(de_raw, (int, float)) else None
 
+        # Compute dividend yield ourselves (yfinance's dividendYield unit is inconsistent)
+        px = info.get("currentPrice") or info.get("regularMarketPrice")
+        rate = info.get("dividendRate")
+        dividend_yield_pct = round(rate / px * 100, 2) if rate and px else None
+
         data = FundamentalsData(
             ticker=clean_stock,
             company_name=info.get("longName"),
@@ -219,7 +224,7 @@ def getStock_fundamentals(stock: str) -> str:
             earnings_growth_pct=_to_pct(info.get("earningsGrowth")),
             debt_to_equity=debt_to_equity,
             free_cash_flow=info.get("freeCashflow"),
-            dividend_yield_pct=_to_pct(info.get("dividendYield")),
+            dividend_yield_pct=dividend_yield_pct,
         )
         return data.model_dump_json()
 
