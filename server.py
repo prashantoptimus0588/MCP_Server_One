@@ -1,16 +1,19 @@
 import os
-from mcp.server.fastmcp import FastMCP
-import yfinance as yf
-import feedparser
+import math
+import json
+import urllib.request
 from urllib.parse import quote
 from datetime import datetime, timezone
-import math
-from models.models import PriceData, DailyBar,FundamentalsData
+import feedparser
+import yfinance as yf
+from mcp.server.fastmcp import FastMCP
+from models.models import PriceData, DailyBar, FundamentalsData, NewsData, NewsItem
 
+# Initialize the FastMCP Server
 mcp = FastMCP(
     "news_server",
     host="0.0.0.0",
-    port=int(os.environ.get("PORT",8000)),
+    port=int(os.environ.get("PORT", 8000)),
 )
 
 def _clean(x, digits=2):
@@ -31,27 +34,25 @@ def _pct(x):
 #############  News and Weather Tools ##############
 
 @mcp.tool()
-def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
+def get_general_news(query: str, days: int = 7, max_items: int = 6) -> str:
     """
-    Fetch recent news headlines about a company or stock, newest first, each with its date and source.
-    Pass the COMPANY NAME plus the word 'stock' (e.g. 'State Bank of India stock'),
-    not the ticker symbol, because news search works better with names.
-    'days' = how far back to look (1-30). 'max_items' = how many headlines to return (1-10).
-    Returns a Pydantic NewsData object serialized to a JSON string.
+    Fetch recent general news headlines about any topic or event, newest first, each with its date and source.
+    
+    :param query: The search term, topic, or event name (e.g., 'artificial intelligence', 'global warming').
+    :param days: How far back to look in days (1-30). Defaults to 7.
+    :param max_items: Max number of headlines to return (1-10). Defaults to 6.
     """
     try:
         days = max(1, min(days, 30))
         max_items = max(1, min(max_items, 10))
 
-        search = quote(f"{query} when:{days}d")
-        url = f"https://google.com{search}&hl=en-IN&gl=IN&ceid=IN:en"
+        encoded_query = quote(f"{query} when:{days}d")
+        url = f"https://google.com{encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
         feed = feedparser.parse(url)
 
-        # Initialize the target parent schema
         news_data = NewsData(query=query, items=[])
 
         if getattr(feed, "bozo", 0) and not feed.entries:
-            # Return valid JSON containing the error text to prevent client breakdown
             return f'{{"error": "Could not fetch the news feed right now."}}'
 
         if not feed.entries:
@@ -68,10 +69,8 @@ def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
         if not raw_items:
             return news_data.model_dump_json()
 
-        # Sort newest first
         raw_items.sort(key=lambda x: x[0], reverse=True)
 
-        # Build individual Pydantic NewsItem objects and append to our main model
         for published, title, source in raw_items[:max_items]:
             news_data.items.append(
                 NewsItem(
@@ -81,18 +80,95 @@ def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
                 )
             )
 
-        # Return the complete structural payload as a clean JSON wire string
         return news_data.model_dump_json()
 
     except Exception as e:
-        return f'{{"error": "Error executing news tool: {str(e)}"}}'
+        return f'{{"error": "Error executing general news tool: {str(e)}"}}'
+
+@mcp.tool()
+def get_stock_news(query: str, days: int = 7, max_items: int = 6) -> str:
+    """
+    Fetch recent news headlines about a company or stock, newest first, each with its date and source.
+    Pass the COMPANY NAME plus the word 'stock' (e.g. 'State Bank of India stock'),
+    not the ticker symbol, because news search works better with names.
+    'days' = how far back to look (1-30). 'max_items' = how many headlines to return (1-10).
+    Returns a Pydantic NewsData object serialized to a JSON string.
+    """
+    try:
+        days = max(1, min(days, 30))
+        max_items = max(1, min(max_items, 10))
+
+        search = quote(f"{query} when:{days}d")
+        url = f"https://google.com{search}&hl=en-IN&gl=IN&ceid=IN:en"
+        feed = feedparser.parse(url)
+
+        news_data = NewsData(query=query, items=[])
+
+        if getattr(feed, "bozo", 0) and not feed.entries:
+            return f'{{"error": "Could not fetch the news feed right now."}}'
+
+        if not feed.entries:
+            return news_data.model_dump_json()
+
+        raw_items = []
+        for e in feed.entries:
+            if not getattr(e, "published_parsed", None):
+                continue
+            published = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+            source = e.get("source", {}).get("title", "Unknown source")
+            raw_items.append((published, e.title, source))
+
+        if not raw_items:
+            return news_data.model_dump_json()
+
+        raw_items.sort(key=lambda x: x[0], reverse=True)
+
+        for published, title, source in raw_items[:max_items]:
+            news_data.items.append(
+                NewsItem(
+                    published=published.strftime("%Y-%m-%d %H:%M UTC"),
+                    title=title,
+                    source=source
+                )
+            )
+
+        return news_data.model_dump_json()
+
+    except Exception as e:
+        return f'{{"error": "Error executing stock news tool: {str(e)}"}}'
  
 @mcp.tool()
 def get_weather(location: str) -> str:
-    """Get the current weather for a given location."""
-    if "delhi" in location.lower():
-        return "It's 15°C and rainy."
-    return "It's 22°C and sunny."
+    """
+    Get the live weather summary for a given location using free API-keyless wttr.in.
+    Returns plain text weather status string.
+    """
+    try:
+        clean_location = location.strip()
+        if not clean_location:
+            return "Error: Location string cannot be empty."
+
+        encoded_location = quote(clean_location)
+        url = f"https://wttr.in{encoded_location}?format=j1"
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'mcp-weather-server/1.0'})
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            current_condition = data['current_condition'][0]
+            temp_c = current_condition['temp_C']
+            weather_desc = current_condition['weatherDesc'][0]['value']
+            humidity = current_condition['humidity']
+            wind_speed = current_condition['windspeedKmph']
+            
+            return (
+                f"It's currently {weather_desc} in {clean_location.title()}. "
+                f"Temperature: {temp_c}°C, Humidity: {humidity}%, Wind Speed: {wind_speed} km/h."
+            )
+    except Exception as e:
+        return f"Error executing weather tool: Could not retrieve live data for '{location}'. ({str(e)})"
+
+#############  Stock Analytics Tools ##############
 
 @mcp.tool()
 def getStock_price_info(stock: str, days: int = 5) -> str:
@@ -107,7 +183,7 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
         df = yf.Ticker(clean_stock).history(period="1y")
 
         if df.empty:
-            return f"Error: No trading data available for ticker '{clean_stock}'."
+            return f'{{"error": "No trading data available for ticker \'{clean_stock}\'."}}'
 
         days = max(1, min(days, 30))
         bars = [
@@ -140,7 +216,7 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
         return data.model_dump_json()
 
     except Exception as e:
-        return f"Error executing price tool: {str(e)}"
+        return f'{{"error": "Error executing price tool: {str(e)}"}}'
     
 @mcp.tool()
 def getStock_fundamentals(stock: str) -> str:
@@ -155,9 +231,8 @@ def getStock_fundamentals(stock: str) -> str:
         info = yf.Ticker(clean_stock).info
 
         if not info or len(info) <= 5:
-            return f"Error: Could not retrieve fundamental analysis metrics for ticker '{clean_stock}'."
+            return f'{{"error": "Could not retrieve fundamental analysis metrics for ticker \'{clean_stock}\'."}}'
 
-        # yfinance gives debtToEquity as a percentage (45 means 0.45), so convert to a ratio
         de_raw = _clean(info.get('debtToEquity'))
         debt_to_equity = round(de_raw / 100, 2) if de_raw is not None else None
 
@@ -181,7 +256,8 @@ def getStock_fundamentals(stock: str) -> str:
         return data.model_dump_json()
 
     except Exception as e:
-        return f"Error executing fundamental tool: {str(e)}"
+        return f'{{"error": "Error executing fundamental tool: {str(e)}"}}'
+
 
 
 if __name__ == "__main__":
