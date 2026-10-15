@@ -61,6 +61,7 @@ class PriceData(BaseModel):
     current_drawdown_pct: Optional[float] = None    # negative number, 0 = at peak
     avg_volume: Optional[int] = None
     recent_bars: list[DailyBar] = Field(default_factory=list)
+    error: Optional[str] = None                     # set when the FETCH failed (not just thin data)
 
     @field_validator("latest_close", "high_52w", "low_52w", "volatility_pct",
                      "max_drawdown_pct", "current_drawdown_pct", mode="before")
@@ -110,6 +111,7 @@ class FundamentalsData(BaseModel):
     debt_to_equity: Optional[float] = None          # ratio, 0.45 means 45%
     free_cash_flow: Optional[float] = None
     dividend_yield_pct: Optional[float] = None
+    error: Optional[str] = None                     # set when the FETCH failed (not just thin data)
 
     @field_validator("market_cap", "beta", "trailing_pe", "forward_pe", "price_to_book", "roe_pct",
                      "profit_margin_pct", "revenue_growth_pct", "earnings_growth_pct",

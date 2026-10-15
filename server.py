@@ -2,6 +2,9 @@ import json
 import logging
 import math
 import os
+import random
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -37,12 +40,20 @@ STALE_DAYS = 7
 # A daily bar for a session that is still trading is partial (tiny volume, moving close). Leave it out so
 # latest_close, volatility and drawdown are computed on finished sessions only.
 EXCLUDE_LIVE_BAR = True
-LIVE_MARKET_STATES = {"REGULAR", "PRE", "PREPRE"}
 MAX_PLAUSIBLE_YIELD_PCT = 30.0
 NEWS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+# ---- Yahoo resilience settings ----
+INFO_TTL_SECONDS = 600          # ticker.info is cached per symbol and shared by every tool
+INFO_ATTEMPTS = 3               # total tries when info is empty or Yahoo answers 429
+HISTORY_ATTEMPTS = 3
+BACKOFF_SECONDS = 1.5           # waits ~1.5s, then ~3s (plus jitter) between tries
+# If none of these are present, the info dict is a blocked/thin response, not real data.
+INFO_PROOF_KEYS = ("marketCap", "sector", "longName", "beta", "trailingPE", "forwardPE",
+                   "regularMarketPrice", "currentPrice")
 
 
 ############# Helpers ##############
@@ -102,15 +113,108 @@ def _to_pct(val: float | None) -> float | None:
     return None if n is None else round(n * 100.0, 2)
 
 
+def _err(e: Exception) -> str:
+    return f"{type(e).__name__}: {str(e)[:150]}"
+
+
+def _sleep_backoff(attempt: int) -> None:
+    time.sleep(BACKOFF_SECONDS * 2 ** (attempt - 1) + random.uniform(0, 0.5))
+
+
+# ---- ticker.info: one cached, retried fetch per symbol, shared by both stock tools ----
+
+_info_cache: dict[str, tuple[float, dict]] = {}
+_info_locks: dict[str, threading.Lock] = {}
+_info_guard = threading.Lock()
+
+
+def _info_usable(info) -> bool:
+    return isinstance(info, dict) and any(info.get(k) is not None for k in INFO_PROOF_KEYS)
+
+
+def _cached_info(symbol: str) -> dict | None:
+    hit = _info_cache.get(symbol)
+    if hit and time.monotonic() - hit[0] < INFO_TTL_SECONDS:
+        return hit[1]
+    return None
+
+
+def _get_info(symbol: str) -> tuple[dict, str | None]:
+    """Returns (info, error). Cached ~10 min per symbol. Retries with backoff when Yahoo returns an empty/thin
+    dict or raises (429 etc.). Failures are never cached, so the next call tries Yahoo again."""
+    cached = _cached_info(symbol)
+    if cached is not None:
+        return cached, None
+
+    with _info_guard:
+        lock = _info_locks.setdefault(symbol, threading.Lock())
+
+    with lock:                                   # concurrent callers for one symbol wait and share the result
+        cached = _cached_info(symbol)
+        if cached is not None:
+            return cached, None
+
+        err = "unknown error"
+        for attempt in range(1, INFO_ATTEMPTS + 1):
+            try:
+                info = yf.Ticker(symbol).info
+                if _info_usable(info):
+                    if len(_info_cache) > 500:
+                        _info_cache.clear()
+                    _info_cache[symbol] = (time.monotonic(), info)
+                    if attempt > 1:
+                        log.info("%s: info OK on attempt %d/%d", symbol, attempt, INFO_ATTEMPTS)
+                    return info, None
+                err = "Yahoo returned an empty response (likely rate limited)"
+                log.warning("%s: info empty on attempt %d/%d (%d keys)", symbol, attempt, INFO_ATTEMPTS,
+                            len(info or {}))
+            except Exception as e:
+                err = _err(e)
+                log.warning("%s: info raised on attempt %d/%d: %s", symbol, attempt, INFO_ATTEMPTS, err)
+            if attempt < INFO_ATTEMPTS:
+                _sleep_backoff(attempt)
+        return {}, err
+
+
+# ---- price history with retry ----
+
+def _fetch_history(symbol: str):
+    """Returns (ticker, df, error). df has NaN-price rows removed and at least 2 rows when error is None."""
+    err = "unknown error"
+    for attempt in range(1, HISTORY_ATTEMPTS + 1):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="1y")
+            if df is not None and not df.empty:
+                # Yahoo can return a row with NaN prices (e.g. an unfinished session); drop it.
+                df = df.dropna(subset=["Open", "High", "Low", "Close"])
+            if df is not None and len(df) >= 2:
+                return ticker, df, None
+            err = "Yahoo returned no usable price history"
+            log.warning("%s: history empty on attempt %d/%d", symbol, attempt, HISTORY_ATTEMPTS)
+        except Exception as e:
+            err = _err(e)
+            log.warning("%s: history raised on attempt %d/%d: %s", symbol, attempt, HISTORY_ATTEMPTS, err)
+        if attempt < HISTORY_ATTEMPTS:
+            _sleep_backoff(attempt)
+    return None, None, err
+
+
+def _session_is_live(ticker: "yf.Ticker") -> bool:
+    """True while the exchange is in its pre-market or regular session. Read from the chart metadata that
+    history() already fetched, so it costs no extra Yahoo request (no ticker.info call)."""
+    try:
+        period = (ticker.history_metadata or {}).get("currentTradingPeriod") or {}
+        start = (period.get("pre") or period.get("regular") or {}).get("start")
+        end = (period.get("regular") or {}).get("end")
+        return bool(start and end and start <= time.time() < end)
+    except Exception:
+        return False
+
+
 def _drop_live_bar(df: pd.DataFrame, ticker: "yf.Ticker") -> pd.DataFrame:
     """Remove today's bar while the exchange is still open (or not yet open)."""
-    if not EXCLUDE_LIVE_BAR or df.empty:
-        return df
-    try:
-        state = str((ticker.info or {}).get("marketState", "")).upper()
-    except Exception:
-        return df
-    if state not in LIVE_MARKET_STATES:
+    if not EXCLUDE_LIVE_BAR or df.empty or not _session_is_live(ticker):
         return df
     tz = getattr(df.index, "tz", None)
     today = datetime.now(tz).date() if tz is not None else datetime.now().date()
@@ -216,20 +320,20 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
     """
     Fetch recent daily OHLCV rows and annualized risk metrics as structured PriceData JSON.
     'days' = recent trading days to list (1-30). Risk metrics use 1-year window of finished sessions.
+    If the fetch failed, the JSON has a non-null "error" field.
     """
     clean_stock = stock.strip().upper()
     try:
         days = max(1, min(days, 30))
-        ticker = yf.Ticker(clean_stock)
-        df = ticker.history(period="1y")
+        ticker, df, err = _fetch_history(clean_stock)
+        if err:
+            log.error("%s: price fetch FAILED: %s", clean_stock, err)
+            return PriceData(ticker=clean_stock, error=err).model_dump_json()
 
-        # Yahoo can return a row with NaN prices (e.g. an unfinished session); drop it so nothing is computed from it.
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
         df = _drop_live_bar(df, ticker)
-
         if len(df) < 2:
-            log.warning("%s: no usable price history", clean_stock)
-            return PriceData(ticker=clean_stock).model_dump_json()
+            log.warning("%s: fewer than 2 finished sessions", clean_stock)
+            return PriceData(ticker=clean_stock, error="fewer than 2 finished trading sessions").model_dump_json()
 
         volume = df["Volume"].fillna(0)
         bars = [
@@ -262,20 +366,26 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
         )
         return data.model_dump_json()
 
-    except Exception:
+    except Exception as e:
         log.exception("getStock_price_info failed for %s", clean_stock)
-        return PriceData(ticker=clean_stock).model_dump_json()
+        return PriceData(ticker=clean_stock, error=_err(e)).model_dump_json()
 
 
 @mcp.tool()
 def getStock_fundamentals(stock: str) -> str:
     """
     Fetch valuation, profitability, growth, dividend, and debt metrics as structured FundamentalsData JSON.
+    If the fetch failed, the JSON has a non-null "error" field and all metrics are null.
     """
     clean_stock = stock.strip().upper()
+
+    info, err = _get_info(clean_stock)
+    if err:
+        log.error("%s: fundamentals fetch FAILED: %s", clean_stock, err)
+        return FundamentalsData(ticker=clean_stock, error=f"Yahoo info unavailable: {err}").model_dump_json()
+
     try:
-        ticker = yf.Ticker(clean_stock)
-        info = ticker.info or {}
+        ticker = yf.Ticker(clean_stock)       # no network call yet; only used by the fallbacks below
 
         de_raw = _num(info.get("debtToEquity"), 6)
         debt_to_equity = round(de_raw / 100.0, 2) if de_raw is not None else None
@@ -304,11 +414,13 @@ def getStock_fundamentals(stock: str) -> str:
             free_cash_flow=_num(info.get("freeCashflow"), 0),
             dividend_yield_pct=_dividend_yield_pct(ticker, info, _last_price(ticker, info)),
         )
+        filled = sum(1 for k, v in data.model_dump().items() if k not in ("ticker", "error") and v is not None)
+        log.info("%s: fundamentals OK, %d fields populated", clean_stock, filled)
         return data.model_dump_json()
 
-    except Exception:
+    except Exception as e:
         log.exception("getStock_fundamentals failed for %s", clean_stock)
-        return FundamentalsData(ticker=clean_stock).model_dump_json()
+        return FundamentalsData(ticker=clean_stock, error=_err(e)).model_dump_json()
 
 
 if __name__ == "__main__":
