@@ -1,4 +1,6 @@
 import json
+import logging
+import math
 import os
 import urllib.error
 import urllib.request
@@ -6,6 +8,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import feedparser
+import pandas as pd
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
 
@@ -24,9 +27,18 @@ mcp = FastMCP(
     port=int(os.environ.get("PORT", 8000)),
 )
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("stock-mcp")
+
 # Threshold constants
 LOW_VOLUME_THRESHOLD = 50_000
 STALE_DAYS = 7
+
+# A daily bar for a session that is still trading is partial (tiny volume, moving close). Leave it out so
+# latest_close, volatility and drawdown are computed on finished sessions only.
+EXCLUDE_LIVE_BAR = True
+LIVE_MARKET_STATES = {"REGULAR", "PRE", "PREPRE"}
+MAX_PLAUSIBLE_YIELD_PCT = 30.0
 NEWS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -74,11 +86,71 @@ def _fetch_news_data(query: str, days: int, max_items: int) -> NewsData:
         return NewsData(query=query, items=[])
 
 
+def _num(val, digits: int = 2) -> float | None:
+    """A rounded finite float, or None for None / NaN / inf / non-numbers."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    f = float(val)
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return round(f, digits)
+
+
 def _to_pct(val: float | None) -> float | None:
     """Converts a fractional value (0.15) to a plain percentage number (15.0)."""
-    if val is None or not isinstance(val, (int, float)):
+    n = _num(val, 6)
+    return None if n is None else round(n * 100.0, 2)
+
+
+def _drop_live_bar(df: pd.DataFrame, ticker: "yf.Ticker") -> pd.DataFrame:
+    """Remove today's bar while the exchange is still open (or not yet open)."""
+    if not EXCLUDE_LIVE_BAR or df.empty:
+        return df
+    try:
+        state = str((ticker.info or {}).get("marketState", "")).upper()
+    except Exception:
+        return df
+    if state not in LIVE_MARKET_STATES:
+        return df
+    tz = getattr(df.index, "tz", None)
+    today = datetime.now(tz).date() if tz is not None else datetime.now().date()
+    if df.index[-1].date() == today:
+        return df.iloc[:-1]
+    return df
+
+
+def _last_price(ticker: "yf.Ticker", info: dict) -> float | None:
+    for key in ("currentPrice", "regularMarketPrice", "previousClose"):
+        px = _num(info.get(key), 6)
+        if px:
+            return px
+    try:
+        return _num(ticker.fast_info.get("last_price"), 6) or None
+    except Exception:
         return None
-    return round(float(val) * 100.0, 2)
+
+
+def _dividend_yield_pct(ticker: "yf.Ticker", info: dict, price: float | None) -> float | None:
+    """Trailing dividend yield in percent. Uses the quoted rate, else the dividends actually paid in 12 months."""
+    if not price:
+        return None
+    pct = None
+    rate = _num(info.get("dividendRate"), 6) or _num(info.get("trailingAnnualDividendRate"), 6)
+    if rate and rate > 0:
+        pct = rate / price * 100
+    else:
+        try:
+            divs = ticker.dividends
+            if divs is not None and len(divs):
+                cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
+                paid = float(divs[divs.index >= cutoff].sum())
+                if paid > 0:
+                    pct = paid / price * 100
+        except Exception:
+            log.exception("dividend history lookup failed")
+    if pct is None or not 0 < pct <= MAX_PLAUSIBLE_YIELD_PCT:
+        return None
+    return round(pct, 2)
 
 
 ############# News and Weather Tools ##############
@@ -143,7 +215,7 @@ def search_ticker(query: str, max_results: int = 5) -> str:
 def getStock_price_info(stock: str, days: int = 5) -> str:
     """
     Fetch recent daily OHLCV rows and annualized risk metrics as structured PriceData JSON.
-    'days' = recent trading days to list (1-30). Risk metrics use 1-year window.
+    'days' = recent trading days to list (1-30). Risk metrics use 1-year window of finished sessions.
     """
     clean_stock = stock.strip().upper()
     try:
@@ -151,11 +223,15 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
         ticker = yf.Ticker(clean_stock)
         df = ticker.history(period="1y")
 
-        if df.empty:
+        # Yahoo can return a row with NaN prices (e.g. an unfinished session); drop it so nothing is computed from it.
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df = _drop_live_bar(df, ticker)
+
+        if len(df) < 2:
+            log.warning("%s: no usable price history", clean_stock)
             return PriceData(ticker=clean_stock).model_dump_json()
 
-        # Build daily bars
-        recent_df = df.tail(days)
+        volume = df["Volume"].fillna(0)
         bars = [
             DailyBar(
                 date=idx.strftime("%Y-%m-%d"),
@@ -163,12 +239,11 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
                 high=round(float(row["High"]), 2),
                 low=round(float(row["Low"]), 2),
                 close=round(float(row["Close"]), 2),
-                volume=int(row["Volume"]),
+                volume=int(vol),
             )
-            for idx, row in recent_df.iterrows()
+            for (idx, row), vol in zip(df.tail(days).iterrows(), volume.tail(days))
         ]
 
-        # Calculate risk metrics
         returns = df["Close"].pct_change().dropna()
         volatility = returns.std() * (252 ** 0.5) * 100
         running_max = df["Close"].cummax()
@@ -176,18 +251,19 @@ def getStock_price_info(stock: str, days: int = 5) -> str:
 
         data = PriceData(
             ticker=clean_stock,
-            latest_close=round(float(df["Close"].iloc[-1]), 2),
-            high_52w=round(float(df["High"].max()), 2),
-            low_52w=round(float(df["Low"].min()), 2),
-            volatility_pct=round(float(volatility), 2) if not returns.empty else None,
-            max_drawdown_pct=round(float(drawdown.min()), 2) if not drawdown.empty else None,
-            current_drawdown_pct=round(float(drawdown.iloc[-1]), 2) if not drawdown.empty else None,
-            avg_volume=int(df["Volume"].mean()),
+            latest_close=_num(df["Close"].iloc[-1]),
+            high_52w=_num(df["High"].max()),
+            low_52w=_num(df["Low"].min()),
+            volatility_pct=_num(volatility) if not returns.empty else None,
+            max_drawdown_pct=_num(drawdown.min()),
+            current_drawdown_pct=_num(drawdown.iloc[-1]),
+            avg_volume=int(volume.mean()),
             recent_bars=bars,
         )
         return data.model_dump_json()
 
     except Exception:
+        log.exception("getStock_price_info failed for %s", clean_stock)
         return PriceData(ticker=clean_stock).model_dump_json()
 
 
@@ -201,34 +277,37 @@ def getStock_fundamentals(stock: str) -> str:
         ticker = yf.Ticker(clean_stock)
         info = ticker.info or {}
 
-        de_raw = info.get("debtToEquity")
-        debt_to_equity = round(float(de_raw) / 100.0, 2) if isinstance(de_raw, (int, float)) else None
+        de_raw = _num(info.get("debtToEquity"), 6)
+        debt_to_equity = round(de_raw / 100.0, 2) if de_raw is not None else None
 
-        # Compute dividend yield ourselves (yfinance's dividendYield unit is inconsistent)
-        px = info.get("currentPrice") or info.get("regularMarketPrice")
-        rate = info.get("dividendRate")
-        dividend_yield_pct = round(rate / px * 100, 2) if rate and px else None
+        market_cap = _num(info.get("marketCap"), 0)
+        if market_cap is None:
+            try:
+                market_cap = _num(ticker.fast_info.get("market_cap"), 0)
+            except Exception:
+                market_cap = None
 
         data = FundamentalsData(
             ticker=clean_stock,
             company_name=info.get("longName"),
             sector=info.get("sector"),
-            market_cap=info.get("marketCap"),
-            beta=round(float(info.get("beta")), 2) if isinstance(info.get("beta"), (int, float)) else None,
-            trailing_pe=round(float(info.get("trailingPE")), 2) if isinstance(info.get("trailingPE"), (int, float)) else None,
-            forward_pe=round(float(info.get("forwardPE")), 2) if isinstance(info.get("forwardPE"), (int, float)) else None,
-            price_to_book=round(float(info.get("priceToBook")), 2) if isinstance(info.get("priceToBook"), (int, float)) else None,
+            market_cap=market_cap,
+            beta=_num(info.get("beta")),
+            trailing_pe=_num(info.get("trailingPE")),
+            forward_pe=_num(info.get("forwardPE")),
+            price_to_book=_num(info.get("priceToBook")),
             roe_pct=_to_pct(info.get("returnOnEquity")),
             profit_margin_pct=_to_pct(info.get("profitMargins")),
             revenue_growth_pct=_to_pct(info.get("revenueGrowth")),
             earnings_growth_pct=_to_pct(info.get("earningsGrowth")),
             debt_to_equity=debt_to_equity,
-            free_cash_flow=info.get("freeCashflow"),
-            dividend_yield_pct=dividend_yield_pct,
+            free_cash_flow=_num(info.get("freeCashflow"), 0),
+            dividend_yield_pct=_dividend_yield_pct(ticker, info, _last_price(ticker, info)),
         )
         return data.model_dump_json()
 
     except Exception:
+        log.exception("getStock_fundamentals failed for %s", clean_stock)
         return FundamentalsData(ticker=clean_stock).model_dump_json()
 
 
