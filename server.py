@@ -47,8 +47,9 @@ NEWS_USER_AGENT = (
 )
 
 # ---- Yahoo resilience settings ----
-INFO_TTL_SECONDS = 600          # ticker.info is cached per symbol and shared by every tool
-INFO_ATTEMPTS = 3               # total tries when info is empty or Yahoo answers 429
+INFO_TTL_SECONDS = 6 * 3600     # fundamentals barely change intraday, so cache for hours
+INFO_ATTEMPTS = 2               # a blocked IP (401 crumb) will not recover by retrying, so keep this low
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")   # set in Render env vars; fallback is skipped if empty
 HISTORY_ATTEMPTS = 3
 BACKOFF_SECONDS = 1.5           # waits ~1.5s, then ~3s (plus jitter) between tries
 # If none of these are present, the info dict is a blocked/thin response, not real data.
@@ -132,6 +133,54 @@ def _info_usable(info) -> bool:
     return isinstance(info, dict) and any(info.get(k) is not None for k in INFO_PROOF_KEYS)
 
 
+def _finnhub_get(path: str, params: dict) -> dict:
+    qs = "&".join(f"{k}={quote(str(v))}" for k, v in {**params, "token": FINNHUB_KEY}.items())
+    req = urllib.request.Request(f"https://finnhub.io/api/v1/{path}?{qs}", headers={"User-Agent": NEWS_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _pct_to_frac(val) -> float | None:
+    n = _num(val, 6)
+    return None if n is None else n / 100.0
+
+
+def _finnhub_info(symbol: str) -> tuple[dict, str | None]:
+    """Fallback when Yahoo blocks the server IP. Returns (info, error) with keys named and scaled like
+    yfinance's ticker.info, so getStock_fundamentals works on it unchanged. US tickers only (free tier)."""
+    if not FINNHUB_KEY:
+        return {}, "FINNHUB_KEY not set"
+    try:
+        m = _finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"}).get("metric") or {}
+        prof = _finnhub_get("stock/profile2", {"symbol": symbol}) or {}
+    except Exception as e:
+        return {}, f"Finnhub: {_err(e)}"
+    if not m:
+        return {}, "Finnhub returned no metrics"
+
+    mcap_m = _num(m.get("marketCapitalization") or prof.get("marketCapitalization"), 6)   # millions
+    de = _num(m.get("totalDebt/totalEquityQuarterly") or m.get("totalDebt/totalEquityAnnual"), 6)
+    pfcf = _num(m.get("pfcfShareTTM"), 6)                  # no direct FCF field; derive: market cap / (price / FCF)
+    fcf_m = mcap_m / pfcf if (mcap_m and pfcf) else None   # millions
+    info = {
+        "longName": prof.get("name"),
+        "sector": prof.get("finnhubIndustry"),
+        "marketCap": mcap_m * 1e6 if mcap_m else None,
+        "beta": m.get("beta"),
+        "trailingPE": m.get("peTTM") or m.get("peNormalizedAnnual"),
+        "forwardPE": m.get("forwardPE"),
+        "priceToBook": m.get("pbQuarterly") or m.get("pbAnnual"),
+        "returnOnEquity": _pct_to_frac(m.get("roeTTM")),
+        "profitMargins": _pct_to_frac(m.get("netProfitMarginTTM")),
+        "revenueGrowth": _pct_to_frac(m.get("revenueGrowthTTMYoy")),
+        "earningsGrowth": _pct_to_frac(m.get("epsGrowthTTMYoy")),
+        "debtToEquity": de * 100.0 if de is not None else None,    # Yahoo reports D/E x100
+        "freeCashflow": fcf_m * 1e6 if fcf_m is not None else None,
+        "dividendRate": m.get("dividendIndicatedAnnual"),
+    }
+    return info, None
+
+
 def _cached_info(symbol: str) -> dict | None:
     hit = _info_cache.get(symbol)
     if hit and time.monotonic() - hit[0] < INFO_TTL_SECONDS:
@@ -173,7 +222,14 @@ def _get_info(symbol: str) -> tuple[dict, str | None]:
                 log.warning("%s: info raised on attempt %d/%d: %s", symbol, attempt, INFO_ATTEMPTS, err)
             if attempt < INFO_ATTEMPTS:
                 _sleep_backoff(attempt)
-        return {}, err
+
+        # Yahoo failed: try Finnhub before giving up.
+        fb_info, fb_err = _finnhub_info(symbol)
+        if _info_usable(fb_info):
+            log.warning("%s: Yahoo info failed (%s); using Finnhub fallback", symbol, err)
+            _info_cache[symbol] = (time.monotonic(), fb_info)
+            return fb_info, None
+        return {}, f"{err}; fallback: {fb_err}"
 
 
 # ---- price history with retry ----

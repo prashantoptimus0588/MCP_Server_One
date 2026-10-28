@@ -666,6 +666,8 @@ dependencies = [
     { name = "feedparser" },
     { name = "mcp", extra = ["cli"] },
     { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "requests" },
     { name = "yfinance" },
 ]
 
@@ -674,6 +676,8 @@ requires-dist = [
     { name = "feedparser", specifier = ">=6.0.14" },
     { name = "mcp", extras = ["cli"], specifier = "<2" },
     { name = "pydantic", specifier = ">=2.14.1" },
+    { name = "python-dotenv", specifier = ">=1.2.4" },
+    { name = "requests", specifier = ">=2.34.2" },
     { name = "yfinance", specifier = ">=1.7.0" },
 ]
 
